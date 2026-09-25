@@ -6,7 +6,9 @@
 同窑规则：
   * 总体积不超过单窑容量；
   * 各器物温度区间存在公共交集；
-  * 烧成温度取交集下界（= 各区间下界的最大值）。
+  * 烧成温度取交集下界（= 各区间下界的最大值）；
+  * 提交釉色隔离互斥对时，互斥对中的两件器物亦不得同窑
+    （该约束直接并入子集可行性判定，dp 与字典序重建无需改动）。
 
 算法：
   1. 枚举全部 2^n 个器物子集，递推每个子集的总体积与温度交集，判定能否成窑。
@@ -131,8 +133,60 @@ def _check_item_count(n: int) -> None:
         raise ValueError("器物数量不得超过 14 件")
 
 
-def _build_tables(items: list[Ware], capacity: int) -> _Tables:
+def _normalise_pairs(
+    separation_pairs: Sequence[Sequence[str]],
+) -> set[tuple[str, str]]:
+    """规范化互斥对：去除两端空白，两端按字典序归并成无序对。"""
+
+    normalised: set[tuple[str, str]] = set()
+    for pair in separation_pairs:
+        a, b = pair
+        a, b = a.strip(), b.strip()
+        normalised.add((a, b) if a <= b else (b, a))
+    return normalised
+
+
+def _conflict_masks(
+    ordered_ids: Sequence[str],
+    separation_pairs: Sequence[Sequence[str]] | None,
+) -> list[int]:
+    """把釉色隔离互斥对转换为「每件器物冲突邻居」位掩码（对称关系）。
+
+    :raises ValueError: 互斥对两端编号相同 / 有重复（含顺序相反）/
+        编号不在器物列表中。
+    """
+
+    n = len(ordered_ids)
+    if not separation_pairs:
+        return [0] * n
+
+    pairs = _normalise_pairs(separation_pairs)
+    if len(pairs) != len(separation_pairs):
+        raise ValueError("釉色隔离互斥对不得重复（顺序相反视为同一对）")
+    id_bit = {item_id: i for i, item_id in enumerate(ordered_ids)}
+    unknown = sorted({x for pair in pairs for x in pair if x not in id_bit})
+    if unknown:
+        raise ValueError("以下器物编号不属于原方案: " + ", ".join(unknown))
+
+    conflict = [0] * n
+    for a, b in pairs:
+        ia, ib = id_bit[a], id_bit[b]
+        if ia == ib:
+            raise ValueError(f"釉色隔离互斥对的两件器物编号必须不同: {a}")
+        conflict[ia] |= 1 << ib
+        conflict[ib] |= 1 << ia
+    return conflict
+
+
+def _build_tables(
+    items: list[Ware],
+    capacity: int,
+    conflict: Sequence[int] | None = None,
+) -> _Tables:
     """枚举 2^n 个子集，递推可成窑标记、子集总体积/温度交集与最少窑次 dp。
+
+    conflict 非空时，其第 i 个位掩码列出与排序后第 i 件器物互斥、不得同窑
+    的器物；该约束并入子集可行性（valid），dp 与重建逻辑完全不变。
 
     :raises CapacityExceededError: 存在单件体积超过容量的器物。
     """
@@ -146,6 +200,8 @@ def _build_tables(items: list[Ware], capacity: int) -> _Tables:
     volumes = [it.volume for it in ordered]
     low = [it.temp_low for it in ordered]
     high = [it.temp_high for it in ordered]
+    if conflict is None:
+        conflict = [0] * n
 
     oversized = [it.item_id for it in ordered if it.volume > capacity]
     if oversized:
@@ -176,6 +232,8 @@ def _build_tables(items: list[Ware], capacity: int) -> _Tables:
                 total <= capacity
                 and inter_low <= inter_high
                 and bool(valid[prev])
+                # 新加入的第 i 件与子集 prev 内任一器物均不互斥
+                and (conflict[i] & prev) == 0
             )
         mask_volume[mask] = total
         mask_temp_low[mask] = inter_low
@@ -201,17 +259,26 @@ def _build_tables(items: list[Ware], capacity: int) -> _Tables:
     return _Tables(n, ids, mask_volume, mask_temp_low, valid, dp)
 
 
-def solve(items: list[Ware], capacity: int) -> list[Kiln]:
+def solve(
+    items: list[Ware],
+    capacity: int,
+    separation_pairs: Sequence[Sequence[str]] | None = None,
+) -> list[Kiln]:
     """求最少窑次、字典序最小的装窑方案。
 
     器物编号按标准字符串字典序排列（如 "1" < "10" < "2"），
     窑内编号升序、窑次间的整体字典序比较均以此为准。
+    separation_pairs 为釉色隔离互斥对（两端编号不同、属全部器物且不重复，
+    顺序相反视为同一对），互斥对中的两件器物不会进入同一窑；该约束并入
+    子集可行性，故最少窑次与并列时的整体字典序规则均与无互斥时一致。
 
     :raises CapacityExceededError: 存在单件体积超过容量的器物。
-    :raises ValueError: 器物列表为空或超过 14 件。
+    :raises ValueError: 器物列表为空或超过 14 件，或互斥对非法。
     """
 
-    tables = _build_tables(items, capacity)
+    ordered = sorted(items, key=lambda it: it.item_id)
+    conflict = _conflict_masks([it.item_id for it in ordered], separation_pairs)
+    tables = _build_tables(items, capacity, conflict)
     n = tables.n
     ids = tables.ids
     valid = tables.valid

@@ -19,16 +19,21 @@ from app.solver import (  # noqa: E402
 )
 
 
-def _feasible(items_by_id, group, capacity):
+def _feasible(items_by_id, group, capacity, forbidden_pairs=()):
     total = sum(items_by_id[i].volume for i in group)
     if total > capacity:
         return False
     lo = max(items_by_id[i].temp_low for i in group)
     hi = min(items_by_id[i].temp_high for i in group)
-    return lo <= hi
+    if lo > hi:
+        return False
+    for a, b in forbidden_pairs:
+        if a in group and b in group:
+            return False
+    return True
 
 
-def _brute_force(items, capacity):
+def _brute_force(items, capacity, forbidden_pairs=()):
     """枚举所有集合划分，返回 (最少窑次, 字典序最小方案)。"""
     ids = sorted(i.item_id for i in items)
     by_id = {i.item_id: i for i in items}
@@ -47,11 +52,11 @@ def _brute_force(items, capacity):
         # elem 放入已有某一组
         for gi in range(len(groups)):
             ng = groups[gi] | {elem}
-            if _feasible(by_id, ng, capacity):
+            if _feasible(by_id, ng, capacity, forbidden_pairs):
                 new_groups = groups[:gi] + [ng] + groups[gi + 1:]
                 partitions(rest, new_groups)
         # elem 单开一组
-        if _feasible(by_id, {elem}, capacity):
+        if _feasible(by_id, {elem}, capacity, forbidden_pairs):
             partitions(rest, groups + [{elem}])
 
     partitions(ids, [])
@@ -165,6 +170,156 @@ def test_n14_performance_and_correctness():
     assert len(kilns) == 1
     assert kilns[0].firing_temp == 1013
     assert kilns[0].total_volume == 14
+
+
+# ---------------------------------------------------------------------------
+# 釉色隔离 solve(items, capacity, separation_pairs)
+# ---------------------------------------------------------------------------
+
+
+def test_glaze_separation_forces_more_kilns():
+    # 每件 5、容量 10、温区全兼容，4 件无互斥时 2 窑 (1,2)(3,4)。
+    items = [Ware(str(i), 5, 100, 200) for i in range(1, 5)]
+    kilns = solve(items, 10)
+    assert len(kilns) == 2
+    # 1 与 2 互斥后，4 件两两容量可行的 2 窑划分中
+    # (1,3)(2,4) 与 (1,4)(2,3) 字典序更小者为 (1,3)(2,4)。
+    kilns = solve(items, 10, [["1", "2"]])
+    assert len(kilns) == 2
+    assert [k.item_ids for k in kilns] == [("1", "3"), ("2", "4")]
+    # 三件两两互斥 -> 3 窑；器物 4 无互斥，并入序列字典序最小可行位置：
+    # ("1") 是 ("1","4") 的前缀，故 4 最终落入末窑 -> ("1")("2")("3","4")。
+    kilns = solve(items, 10, [["1", "2"], ["1", "3"], ["2", "3"]])
+    assert len(kilns) == 3
+    assert [k.item_ids for k in kilns] == [("1",), ("2",), ("3", "4")]
+    # 全部两两互斥 -> 每件单独成窑
+    pairs = [(a, b) for a, b in __import__("itertools").combinations(
+        [str(i) for i in range(1, 5)], 2
+    )]
+    kilns = solve(items, 10, pairs)
+    assert len(kilns) == 4
+    assert [k.item_ids for k in kilns] == [("1",), ("2",), ("3",), ("4",)]
+
+
+def test_glaze_separation_keeps_temp_and_capacity_rules():
+    # 互斥与温区规则叠加：p4 温区不兼容本就单独成窑；
+    # 互斥 (p1,p3) 与 (p2,p3) 迫使 p3 单独一窑，p1、p2 温区有交集但
+    # 体积 5+6 > 10 亦不可同窑 -> 4 窑。
+    items = [
+        Ware("p1", 5, 100, 200),
+        Ware("p2", 6, 120, 220),
+        Ware("p3", 4, 150, 300),
+        Ware("p4", 5, 1000, 1100),
+    ]
+    kilns = solve(items, 10, [["p1", "p3"], ["p2", "p3"]])
+    assert len(kilns) == 4
+    assert [k.item_ids for k in kilns] == [
+        ("p1",), ("p2",), ("p3",), ("p4",)
+    ]
+    assert [k.firing_temp for k in kilns] == [100, 120, 150, 1000]
+    assert [k.total_volume for k in kilns] == [5, 6, 4, 5]
+
+    # 仅互斥 (p2,p3)：不增加窑次，原 (p1)(p2,p3)(p4) 改为
+    # 字典序最小的 (p1,p3)(p2)(p4)。
+    kilns = solve(items, 10, [["p3", "p2"]])
+    assert len(kilns) == 3
+    assert [k.item_ids for k in kilns] == [("p1", "p3"), ("p2",), ("p4",)]
+    assert kilns[0].firing_temp == 150 and kilns[0].total_volume == 9
+
+
+def test_glaze_separation_pair_order_is_unordered():
+    # 互斥对为无序关系：(a,b) 与 (b,a) 语义相同，且与器物传入顺序无关。
+    items = [
+        Ware("b", 5, 100, 200),
+        Ware("a", 5, 100, 200),
+        Ware("c", 5, 100, 200),
+        Ware("d", 5, 100, 200),
+    ]
+    r1 = solve(items, 10, [["a", "b"]])
+    r2 = solve(items, 10, [["b", "a"]])
+    assert [k.item_ids for k in r1] == [k.item_ids for k in r2]
+    assert [k.item_ids for k in r1] == [("a", "c"), ("b", "d")]
+
+
+def test_glaze_separation_invalid_pairs():
+    items = [Ware("a", 1, 100, 200), Ware("b", 1, 100, 200)]
+    # 两端编号相同
+    for bad in ([["a", "a"]], [[" a ", "a"]]):
+        try:
+            solve(items, 10, bad)
+            assert False, f"{bad}: 应抛出 ValueError"
+        except ValueError:
+            pass
+    # 重复（含顺序相反）
+    for bad in ([["a", "b"], ["a", "b"]], [["a", "b"], ["b", "a"]]):
+        try:
+            solve(items, 10, bad)
+            assert False, f"{bad}: 应抛出 ValueError"
+        except ValueError:
+            pass
+    # 编号不属于器物列表
+    try:
+        solve(items, 10, [["a", "x"]])
+        assert False, "应抛出 ValueError"
+    except ValueError:
+        pass
+
+
+def test_glaze_separation_none_or_empty_pairs_matches_solve():
+    # separation_pairs=None 与空列表时，结果必须与原 solve 完全一致
+    items = [Ware(str(i), 6, 100, 200) for i in range(1, 4)]
+    base = [k.item_ids for k in solve(items, 10)]
+    assert [k.item_ids for k in solve(items, 10, None)] == base
+    assert [k.item_ids for k in solve(items, 10, [])] == base
+    assert base == [("1",), ("2",), ("3",)]
+
+
+def test_glaze_separation_random_brute_force():
+    # 随机小规模用例：互斥约束下的最少窑次与整体字典序方案同暴力枚举交叉验证
+    import itertools
+
+    rng = random.Random(2026)
+    for trial in range(400):
+        n = rng.randint(1, 7)
+        items = []
+        for i in range(n):
+            vol = rng.randint(1, 8)
+            lo = rng.randint(900, 1000)
+            hi = lo + rng.randint(0, 100)
+            items.append(Ware(f"id{i}", vol, lo, hi))
+        capacity = rng.randint(max(it.volume for it in items), 18)
+        ids = sorted(it.item_id for it in items)
+        all_pairs = list(itertools.combinations(ids, 2))
+        rng.shuffle(all_pairs)
+        pairs = [list(p) for p in all_pairs[: rng.randint(0, len(all_pairs))]]
+
+        kilns = solve(items, capacity, pairs)
+        exp_k, exp_plan = _brute_force(items, capacity, pairs)
+        assert len(kilns) == exp_k, f"trial {trial}: {len(kilns)} != {exp_k}"
+        got_plan = tuple(k.item_ids for k in kilns)
+        assert got_plan == exp_plan, (
+            f"trial {trial}: {got_plan} != {exp_plan}, pairs={pairs}"
+        )
+        # 每条互斥对在结果中都必须分属不同窑
+        groups = [set(k.item_ids) for k in kilns]
+        for a, b in pairs:
+            assert not any(a in g and b in g for g in groups), (
+                f"trial {trial}: 互斥对 {a},{b} 同窑"
+            )
+
+
+def test_glaze_separation_performance_n14():
+    # n=14 且全部两两互斥 -> 14 窑，耗时与无互斥求解同量级
+    import itertools
+    import time
+
+    items = [Ware(f"i{i:02d}", 1, 1000, 1000) for i in range(14)]
+    pairs = list(itertools.combinations([w.item_id for w in items], 2))
+    t0 = time.time()
+    kilns = solve(items, 9, pairs)
+    elapsed = time.time() - t0
+    assert elapsed < 5.0, f"全互斥 n=14 耗时 {elapsed:.2f}s"
+    assert len(kilns) == 14
 
 
 def test_min_capacity_basic():

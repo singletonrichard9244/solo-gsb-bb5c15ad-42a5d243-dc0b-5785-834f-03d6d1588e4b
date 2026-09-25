@@ -215,6 +215,52 @@ class PlanCompareOut(BaseModel):
     )
 
 
+class GlazeSeparationIn(BaseModel):
+    """釉色隔离请求：提交非空的器物互斥对列表。"""
+
+    separation_pairs: list[list[str]] = Field(
+        ...,
+        min_length=1,
+        max_length=14 * 13 // 2,
+        description=(
+            "器物互斥对列表（非空）：每对恰好两个互不相同的器物编号，"
+            "两编号均须属于原方案；对不得重复（顺序相反视为同一对）"
+        ),
+    )
+
+    @field_validator("separation_pairs")
+    @classmethod
+    def _validate_pairs(cls, pairs: list[list[str]]) -> list[list[str]]:
+        if not pairs:
+            raise ValueError("器物互斥对列表不能为空")
+        normalised: set[tuple[str, str]] = set()
+        for raw in pairs:
+            if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+                raise ValueError("每个互斥对必须恰好包含两个器物编号")
+            a, b = raw[0].strip(), raw[1].strip()
+            if not a or not b:
+                raise ValueError("互斥对中的器物编号不得为空白字符串")
+            if a == b:
+                raise ValueError(f"互斥对中的两件器物编号必须不同: {a}")
+            key = (a, b) if a <= b else (b, a)
+            if key in normalised:
+                raise ValueError(
+                    f"器物互斥对不得重复（顺序相反视为同一对）: {key[0]}, {key[1]}"
+                )
+            normalised.add(key)
+        # 排序返回，保证请求规整后（去空白、无序对归一化）的次序确定
+        return [list(key) for key in sorted(normalised)]
+
+
+class GlazeSeparationOut(BaseModel):
+    """釉色隔离建议装窑结果（只读计算，不改写或另存原方案）。"""
+
+    plan_id: str = Field(..., description="原方案 ID")
+    separation_pair_count: int = Field(..., description="互斥对数量（无序对归一化后）")
+    kiln_count: int = Field(..., description="满足全部互斥对的最少窑次")
+    kilns: list[KilnOut] = Field(..., description="建议装窑明细")
+
+
 class CancelItemsOut(BaseModel):
     """取消器物并重排的结果（另存为新方案，不改写原方案）。"""
 
