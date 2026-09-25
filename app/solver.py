@@ -39,6 +39,11 @@
 位掩码 DP：按原窑次序逐标签决定其与哪一新窑配对（或不配），新窑即剩余
 器物的一个可行非空子集，状态值为 (已留窑数, 已选新窑的规范化排名集合)，
 同一状态取留窑数更大、并列时窑序列字典序更小者。
+
+互斥分窑（solve 的 exclusion_pairs 参数）：互斥对 (a, b) 表示两件器物
+不得同窑烧成。互斥判定纳入子集可行性递推——向子集加入器物 i 时，若子集
+内已含有与 i 互斥的器物（conflict 位掩码），该子集不可成窑；最少窑次
+DP 与整体字典序重建规则不变。
 """
 
 from __future__ import annotations
@@ -131,10 +136,18 @@ def _check_item_count(n: int) -> None:
         raise ValueError("器物数量不得超过 14 件")
 
 
-def _build_tables(items: list[Ware], capacity: int) -> _Tables:
+def _build_tables(
+    items: list[Ware],
+    capacity: int,
+    exclusion_pairs: Sequence[tuple[str, str]] | None = None,
+) -> _Tables:
     """枚举 2^n 个子集，递推可成窑标记、子集总体积/温度交集与最少窑次 dp。
 
+    互斥对 (a, b) 表示两件器物不得同窑：向子集加入器物 i 时，若子集内
+    已有与 i 互斥的器物，则该子集不可成窑。
+
     :raises CapacityExceededError: 存在单件体积超过容量的器物。
+    :raises ValueError: 互斥对内的两件器物编号相同，或含未知器物编号。
     """
 
     n = len(items)
@@ -153,6 +166,22 @@ def _build_tables(items: list[Ware], capacity: int) -> _Tables:
             f"以下器物单件体积超过单窑容量 {capacity}，无法烧成: "
             + ", ".join(oversized)
         )
+
+    # 互斥约束：conflict[i] 为与第 i 件器物互斥的器物位掩码
+    conflict = [0] * n
+    if exclusion_pairs:
+        index_of = {item_id: i for i, item_id in enumerate(ids)}
+        for a, b in exclusion_pairs:
+            if a == b:
+                raise ValueError(f"互斥对内的两件器物编号须不同: {a}")
+            unknown = [x for x in (a, b) if x not in index_of]
+            if unknown:
+                raise ValueError(
+                    "互斥对含不属于器物列表的编号: " + ", ".join(unknown)
+                )
+            i, j = index_of[a], index_of[b]
+            conflict[i] |= 1 << j
+            conflict[j] |= 1 << i
 
     size = 1 << n
 
@@ -176,6 +205,7 @@ def _build_tables(items: list[Ware], capacity: int) -> _Tables:
                 total <= capacity
                 and inter_low <= inter_high
                 and bool(valid[prev])
+                and not (prev & conflict[i])  # 子集内已有与 i 互斥的器物
             )
         mask_volume[mask] = total
         mask_temp_low[mask] = inter_low
@@ -201,17 +231,24 @@ def _build_tables(items: list[Ware], capacity: int) -> _Tables:
     return _Tables(n, ids, mask_volume, mask_temp_low, valid, dp)
 
 
-def solve(items: list[Ware], capacity: int) -> list[Kiln]:
+def solve(
+    items: list[Ware],
+    capacity: int,
+    exclusion_pairs: Sequence[tuple[str, str]] | None = None,
+) -> list[Kiln]:
     """求最少窑次、字典序最小的装窑方案。
 
     器物编号按标准字符串字典序排列（如 "1" < "10" < "2"），
     窑内编号升序、窑次间的整体字典序比较均以此为准。
 
+    :param exclusion_pairs: 互斥对列表，(a, b) 表示两件器物不得同窑烧成；
+        互斥判定已纳入子集可行性，最少窑次与整体字典序规则不变。
     :raises CapacityExceededError: 存在单件体积超过容量的器物。
-    :raises ValueError: 器物列表为空或超过 14 件。
+    :raises ValueError: 器物列表为空或超过 14 件；
+        互斥对内的两件器物编号相同，或含未知器物编号。
     """
 
-    tables = _build_tables(items, capacity)
+    tables = _build_tables(items, capacity, exclusion_pairs)
     n = tables.n
     ids = tables.ids
     valid = tables.valid

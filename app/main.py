@@ -7,6 +7,7 @@ POST /plans/{plan_id}/capacity-target    求使最少窑次不超过目标的最
 POST /plans/{plan_id}/production-limit   限窑次接单：在最多 max_kilns 窑内择优保留器物
 POST /plans/{plan_id}/append-items       追加器物：填入原窑或追加窑次，另存为新方案
 POST /plans/{plan_id}/cancel-items       取消器物：紧凑重排，另存为新方案
+POST /plans/{plan_id}/glaze-separation   互斥分窑：满足全部互斥对的最少窑次建议（只读）
 GET  /health                             健康检查
 """
 
@@ -26,6 +27,8 @@ from .schemas import (
     CapacityTargetIn,
     CapacityTargetOut,
     ErrorOut,
+    GlazeSeparationIn,
+    GlazeSeparationOut,
     KilnOut,
     KilnPairOut,
     PlanCompareIn,
@@ -533,4 +536,72 @@ def cancel_plan_items(plan_id: str, payload: CancelItemsIn) -> CancelItemsOut:
             KilnPairOut(source_index=s, target_index=t) for s, t in result.pairs
         ],
         new_plan=PlanOut(**new_plan),
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/glaze-separation",
+    response_model=GlazeSeparationOut,
+    tags=["plans"],
+    responses={
+        400: {"model": ErrorOut, "description": "互斥对含不属于原方案的编号"},
+        404: {"model": ErrorOut, "description": "方案不存在"},
+    },
+    summary="互斥分窑：满足全部互斥对的最少窑次建议（只读）",
+)
+def glaze_separation(plan_id: str, payload: GlazeSeparationIn) -> GlazeSeparationOut:
+    plan = database.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "PLAN_NOT_FOUND",
+                "message": f"未找到排程方案: {plan_id}",
+            },
+        )
+
+    # 互斥对内编号不同 / 列表非空 / 互斥对不重复已在请求模型（422）校验
+    original_ids = {it["item_id"] for it in plan["items"]}
+    referenced = {p.item_a for p in payload.pairs} | {
+        p.item_b for p in payload.pairs
+    }
+    unknown = sorted(referenced - original_ids)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "UNKNOWN_ITEM_ID",
+                "message": f"以下器物编号不属于原方案: {', '.join(unknown)}",
+            },
+        )
+
+    # 以原方案保存的单窑容量、器物体积与温度区间，叠加全部互斥对重新求解；
+    # 仅作建议返回，不改写或另存方案。
+    wares = [
+        Ware(
+            item_id=it["item_id"],
+            volume=it["volume"],
+            temp_low=it["temp_low"],
+            temp_high=it["temp_high"],
+        )
+        for it in plan["items"]
+    ]
+    kilns = solve(
+        wares,
+        plan["capacity"],
+        exclusion_pairs=[(p.item_a, p.item_b) for p in payload.pairs],
+    )
+
+    return GlazeSeparationOut(
+        plan_id=plan["id"],
+        kiln_count=len(kilns),
+        kilns=[
+            KilnOut(
+                index=idx,
+                item_ids=list(k.item_ids),
+                total_volume=k.total_volume,
+                firing_temp=k.firing_temp,
+            )
+            for idx, k in enumerate(kilns, start=1)
+        ],
     )

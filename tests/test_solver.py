@@ -1032,6 +1032,158 @@ def test_cancel_items_performance_n14():
     assert result.max_stayed_count == 13
 
 
+# ---------------------------------------------------------------------------
+# 互斥分窑 solve(..., exclusion_pairs)
+# ---------------------------------------------------------------------------
+
+
+def _brute_force_exclusions(items, capacity, pairs):
+    """枚举所有集合划分，返回满足全部互斥对的 (最少窑次, 字典序最小方案)。"""
+    ids = sorted(i.item_id for i in items)
+    by_id = {i.item_id: i for i in items}
+    forbidden = [frozenset(p) for p in pairs]
+    best = None  # (窑次数, 方案元组)
+
+    def feasible(group):
+        total = sum(by_id[i].volume for i in group)
+        if total > capacity:
+            return False
+        lo = max(by_id[i].temp_low for i in group)
+        hi = min(by_id[i].temp_high for i in group)
+        if lo > hi:
+            return False
+        return not any(pair <= group for pair in forbidden)
+
+    def partitions(s, groups):
+        nonlocal best
+        if not s:
+            plan = tuple(sorted(tuple(sorted(g)) for g in groups))
+            k = len(plan)
+            if best is None or (k, plan) < (best[0], best[1]):
+                best = (k, plan)
+            return
+        elem = s[0]
+        rest = s[1:]
+        for gi in range(len(groups)):
+            ng = groups[gi] | {elem}
+            if feasible(ng):
+                partitions(rest, groups[:gi] + [ng] + groups[gi + 1:])
+        if feasible({elem}):
+            partitions(rest, groups + [{elem}])
+
+    partitions(ids, [])
+    return best
+
+
+def _check_exclusion_result(kilns, items, capacity, pairs):
+    """校验结果的基本性质：划分完备、各窑满足容量/温区/互斥约束。"""
+    by_id = {it.item_id: it for it in items}
+    grouped = [x for k in kilns for x in k.item_ids]
+    assert sorted(grouped) == sorted(by_id)
+    assert len(grouped) == len(set(grouped))
+    for k in kilns:
+        assert list(k.item_ids) == sorted(k.item_ids)
+        assert k.total_volume == sum(by_id[i].volume for i in k.item_ids)
+        assert k.total_volume <= capacity
+        assert k.firing_temp == max(by_id[i].temp_low for i in k.item_ids)
+        assert k.firing_temp <= min(by_id[i].temp_high for i in k.item_ids)
+        members = set(k.item_ids)
+        for a, b in pairs:
+            assert not ({a, b} <= members), f"窑内出现互斥对 ({a}, {b})"
+
+
+def test_exclusion_pairs_force_separation():
+    # 两件器物本可同窑，互斥后必须分两窑
+    items = [Ware("a", 5, 100, 200), Ware("b", 5, 100, 200)]
+    assert len(solve(items, 10)) == 1
+    kilns = solve(items, 10, exclusion_pairs=[("a", "b")])
+    assert [k.item_ids for k in kilns] == [("a",), ("b",)]
+    _check_exclusion_result(kilns, items, 10, [("a", "b")])
+
+
+def test_exclusion_pairs_regroup_lex_tiebreak():
+    # 三件全兼容、容量 9 本可 1 窑；互斥 (a,b) 后最少 2 窑，
+    # 候选 (a)(b,c) 与 (a,c)(b)，("a",) 是 ("a","c") 的前缀，字典序更小。
+    items = [Ware(x, 3, 100, 200) for x in "abc"]
+    kilns = solve(items, 9, exclusion_pairs=[("a", "b")])
+    assert len(kilns) == 2
+    assert [k.item_ids for k in kilns] == [("a",), ("b", "c")]
+    assert kilns[0].total_volume == 3
+    assert kilns[1].total_volume == 6
+    _check_exclusion_result(kilns, items, 9, [("a", "b")])
+
+
+def test_exclusion_pairs_all_mutual():
+    # 三件两两互斥 -> 每件一窑
+    items = [Ware(x, 3, 100, 200) for x in "abc"]
+    pairs = [("a", "b"), ("a", "c"), ("b", "c")]
+    kilns = solve(items, 9, exclusion_pairs=pairs)
+    assert [k.item_ids for k in kilns] == [("a",), ("b",), ("c",)]
+    _check_exclusion_result(kilns, items, 9, pairs)
+
+
+def test_exclusion_pairs_combined_with_capacity_and_temp():
+    # 互斥约束与容量、温区约束同时生效：
+    # p2/p3 温区兼容且体积之和恰为容量，但互斥后须分开；
+    # p1/p3 可同窑（体积 9、温区交集 150~200），整体字典序最小。
+    items = [
+        Ware("p1", 5, 100, 200),
+        Ware("p2", 6, 120, 220),
+        Ware("p3", 4, 150, 300),
+        Ware("p4", 5, 1000, 1100),
+    ]
+    pairs = [("p2", "p3")]
+    kilns = solve(items, 10, exclusion_pairs=pairs)
+    assert [k.item_ids for k in kilns] == [("p1", "p3"), ("p2",), ("p4",)]
+    assert kilns[0].firing_temp == 150
+    assert kilns[0].total_volume == 9
+    _check_exclusion_result(kilns, items, 10, pairs)
+
+
+def test_exclusion_pairs_invalid():
+    items = [Ware("a", 1, 100, 200), Ware("b", 1, 100, 200)]
+    for bad in ([("a", "a")], [("a", "z")], [("z", "a")]):
+        try:
+            solve(items, 10, exclusion_pairs=bad)
+            assert False, f"{bad}: 应抛出 ValueError"
+        except ValueError:
+            pass
+
+
+def test_exclusion_pairs_random_brute_force():
+    # 随机小规模用例：最少窑次与整体字典序方案同暴力枚举交叉验证
+    rng = random.Random(2026)
+    for trial in range(300):
+        n = rng.randint(1, 7)
+        ids = [f"id{i}" for i in range(n)]
+        capacity = rng.randint(5, 15)
+        items = []
+        for i in range(n):
+            vol = rng.randint(1, 8)
+            lo = rng.randint(900, 1000)
+            hi = lo + rng.randint(0, 100)
+            items.append(Ware(ids[i], vol, lo, hi))
+        if any(it.volume > capacity for it in items):
+            continue
+        pairs = [
+            (ids[i], ids[j])
+            for i in range(n)
+            for j in range(i + 1, n)
+            if rng.random() < 0.3
+        ]
+        got = solve(items, capacity, exclusion_pairs=pairs)
+        got_plan = tuple(k.item_ids for k in got)
+        exp_k, exp_plan = _brute_force_exclusions(items, capacity, pairs)
+        assert len(got) == exp_k, (
+            f"trial {trial}: {len(got)} != {exp_k}, items={items}, pairs={pairs}"
+        )
+        assert got_plan == exp_plan, (
+            f"trial {trial}: {got_plan} != {exp_plan}, "
+            f"items={items}, cap={capacity}, pairs={pairs}"
+        )
+        _check_exclusion_result(got, items, capacity, pairs)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

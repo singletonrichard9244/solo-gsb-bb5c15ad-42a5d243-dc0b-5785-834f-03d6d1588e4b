@@ -236,3 +236,59 @@ class CancelItemsOut(BaseModel):
         ..., description="原窑次与新窑次的一对一配对，按原窑次序号升序"
     )
     new_plan: PlanOut = Field(..., description="重排后另存的新方案完整内容")
+
+
+class GlazePairIn(BaseModel):
+    """一对互斥器物：两件器物不得同窑烧成。"""
+
+    item_a: str = Field(..., min_length=1, description="器物编号（非空字符串）")
+    item_b: str = Field(..., min_length=1, description="器物编号（非空字符串）")
+
+    @field_validator("item_a", "item_b")
+    @classmethod
+    def _strip_and_check(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("器物编号不得为空白字符串")
+        return v
+
+    @model_validator(mode="after")
+    def _distinct_ids(self):
+        if self.item_a == self.item_b:
+            raise ValueError(
+                f"互斥对内的两件器物编号须不同: {self.item_a}"
+            )
+        return self
+
+
+class GlazeSeparationIn(BaseModel):
+    """互斥分窑请求。"""
+
+    pairs: list[GlazePairIn] = Field(
+        ...,
+        min_length=1,
+        description="互斥对列表（非空、不重复；每对两件器物不得同窑烧成）",
+    )
+
+    @model_validator(mode="after")
+    def _unique_pairs(self):
+        seen: set[frozenset[str]] = set()
+        dup: list[str] = []
+        for p in self.pairs:
+            key = frozenset((p.item_a, p.item_b))
+            if key in seen:
+                label = f"({p.item_a}, {p.item_b})"
+                if label not in dup:
+                    dup.append(label)
+            seen.add(key)
+        if dup:
+            raise ValueError(f"互斥对不得重复，重复互斥对: {', '.join(dup)}")
+        return self
+
+
+class GlazeSeparationOut(BaseModel):
+    """互斥分窑建议结果（只读计算，不改写或另存方案）。"""
+
+    plan_id: str = Field(..., description="原方案 ID")
+    kiln_count: int = Field(..., description="满足全部互斥对的最少窑次")
+    kilns: list[KilnOut] = Field(..., description="满足全部互斥对的装窑明细")
